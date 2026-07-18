@@ -797,6 +797,259 @@ app.post("/api/export-pdf", (req, res) => {
   res.send(reportHtml);
 });
 
+// 6. Dataset / Case Upload and AI Ingestion Endpoint
+app.post("/api/upload-dataset", async (req, res) => {
+  const { fileName, fileType, content, sessionId, role = "Investigator" } = req.body;
+  const session_id = sessionId || "default_session";
+  const logs: CatalystServiceLog[] = [];
+  const startTimer = Date.now();
+
+  logs.push(createCatalystLog("Data Store", "info", `Received dataset upload: ${fileName} (${fileType})`));
+
+  let extractedData: any = null;
+
+  // If it's a JSON file, check if it's already structured
+  if (fileType === "application/json" || fileName.endsWith(".json")) {
+    try {
+      const parsed = JSON.parse(content);
+      // Let's check if it's a single case or multiple cases
+      if (parsed.caseMaster && parsed.caseMaster.CaseNo) {
+        extractedData = parsed;
+        logs.push(createCatalystLog("Data Store", "success", "Parsed structured JSON case details."));
+      } else if (Array.isArray(parsed)) {
+        extractedData = parsed[0];
+        logs.push(createCatalystLog("Data Store", "success", "Parsed JSON array. Ingesting first case record."));
+      } else {
+        logs.push(createCatalystLog("Data Store", "warning", "JSON does not match schema. Proceeding with AI parsing."));
+      }
+    } catch (e) {
+      logs.push(createCatalystLog("Data Store", "warning", "Failed to parse JSON. Falling back to AI extraction."));
+    }
+  }
+
+  // If not parsed yet (unstructured text, CSV, or failed JSON), use Gemini to structure it
+  if (!extractedData) {
+    const aiStart = Date.now();
+    logs.push(createCatalystLog("QuickML RAG", "info", "Sending document content to Gemini for entity extraction & structuring..."));
+    
+    try {
+      const prompt = `You are a structured data extraction agent for the Karnataka State Police Crime Database.
+Analyze the following document, text, or dataset content representing crime/case details.
+Extract all relevant facts and structure it EXACTLY into the following JSON schema:
+{
+  "caseMaster": {
+    "CrimeNo": "string (18-digit unique string, if not present generate a unique one starting with 1044300062026)",
+    "CaseNo": "string (unique 9-digit string starting with 2026)",
+    "CrimeRegisteredDate": "YYYY-MM-DD (use today's date if not found)",
+    "latitude": number (defaults to 12.9716),
+    "longitude": number (defaults to 77.5946),
+    "BriefFacts": "string (clear summary of the case in English)",
+    "BriefFacts_KN": "string (clear summary of the case in Kannada, translate from English if not provided)"
+  },
+  "complainant": {
+    "ComplainantName": "string",
+    "AgeYear": number,
+    "GenderID": number (1 for Male, 2 for Female)
+  },
+  "accused": [
+    {
+      "AccusedName": "string",
+      "AgeYear": number,
+      "GenderID": number,
+      "PersonID": "string (e.g. A1, A2)"
+    }
+  ],
+  "victim": [
+    {
+      "VictimName": "string",
+      "AgeYear": number,
+      "GenderID": number,
+      "VictimPolice": "string ('0' or '1')"
+    }
+  ],
+  "acts": [
+    {
+      "ActCode": "string (must be one of: IPC, NDPS, IT_ACT, COPTA)",
+      "SectionCode": "string (e.g. 302, 379, 420, 20b, 66D, 498A)"
+    }
+  ]
+}
+
+Provide ONLY the raw JSON output. Do not wrap it in markdown code blocks or add any other text.
+Content to analyze:
+"${content}"`;
+
+      const aiResponse = await ai.models.generateContent({
+        model: "gemini-3.5-flash",
+        contents: prompt
+      });
+
+      const responseText = aiResponse.text?.trim() || "";
+      const cleanedJson = responseText.replace(/```json/gi, "").replace(/```/g, "").trim();
+      extractedData = JSON.parse(cleanedJson);
+      logs.push(createCatalystLog("QuickML RAG", "success", "Gemini successfully structured the case data.", Date.now() - aiStart));
+    } catch (err: any) {
+      logs.push(createCatalystLog("QuickML RAG", "warning", `Failed to structure data: ${err.message}`));
+      return res.status(500).json({ error: `Failed to extract structured data from file content. Details: ${err.message}`, logs });
+    }
+  }
+
+  // Inject extracted details into the database
+  if (extractedData && extractedData.caseMaster) {
+    const nextCaseId = caseMasters.length + 1;
+    
+    const newCaseMaster = {
+      CaseMasterID: nextCaseId,
+      CrimeNo: extractedData.caseMaster.CrimeNo || `1044300062026${String(nextCaseId).padStart(4, "0")}`,
+      CaseNo: extractedData.caseMaster.CaseNo || `202600${String(nextCaseId).padStart(3, "0")}`,
+      CrimeRegisteredDate: extractedData.caseMaster.CrimeRegisteredDate || new Date().toISOString().split("T")[0],
+      PolicePersonID: 506, // Default to Raghavendra
+      PoliceStationID: 1001, // Cubbon Park
+      CaseCategoryID: 1, // FIR
+      GravityOffenceID: 1, 
+      CrimeMajorHeadID: 201, 
+      CrimeMinorHeadID: 301, 
+      CaseStatusID: 1, // Under Investigation
+      CourtID: 401,
+      IncidentFromDate: new Date().toISOString(),
+      IncidentToDate: new Date().toISOString(),
+      InfoReceivedPSDate: new Date().toISOString(),
+      latitude: Number(extractedData.caseMaster.latitude) || 12.9716,
+      longitude: Number(extractedData.caseMaster.longitude) || 77.5946,
+      BriefFacts: extractedData.caseMaster.BriefFacts || "No facts provided.",
+      BriefFacts_KN: extractedData.caseMaster.BriefFacts_KN || ""
+    };
+
+    // Save CaseMaster
+    caseMasters.push(newCaseMaster);
+
+    // Save Complainant
+    if (extractedData.complainant) {
+      const nextCompId = complainants.length + 1;
+      complainants.push({
+        ComplainantID: nextCompId,
+        CaseMasterID: nextCaseId,
+        ComplainantName: extractedData.complainant.ComplainantName || "Unknown Complainant",
+        AgeYear: Number(extractedData.complainant.AgeYear) || 35,
+        OccupationID: 1,
+        ReligionID: 1,
+        CasteID: 11,
+        GenderID: Number(extractedData.complainant.GenderID) || 1
+      });
+    }
+
+    // Save Accused
+    if (extractedData.accused && Array.isArray(extractedData.accused)) {
+      extractedData.accused.forEach((acc: any, i: number) => {
+        accusedList.push({
+          AccusedMasterID: accusedList.length + 1,
+          CaseMasterID: nextCaseId,
+          AccusedName: acc.AccusedName || "Unknown Suspect",
+          AgeYear: Number(acc.AgeYear) || 30,
+          GenderID: Number(acc.GenderID) || 1,
+          PersonID: acc.PersonID || `A${i+1}`
+        });
+      });
+    }
+
+    // Save Victims
+    if (extractedData.victim && Array.isArray(extractedData.victim)) {
+      extractedData.victim.forEach((vic: any) => {
+        victims.push({
+          VictimMasterID: victims.length + 1,
+          CaseMasterID: nextCaseId,
+          VictimName: vic.VictimName || "Unknown Victim",
+          AgeYear: Number(vic.AgeYear) || 30,
+          GenderID: Number(vic.GenderID) || 2,
+          VictimPolice: vic.VictimPolice || "0"
+        });
+      });
+    }
+
+    // Save Acts
+    if (extractedData.acts && Array.isArray(extractedData.acts)) {
+      extractedData.acts.forEach((act: any, i: number) => {
+        actSectionAssociations.push({
+          CaseMasterID: nextCaseId,
+          ActID: act.ActCode || "IPC",
+          SectionID: act.SectionCode || "302",
+          ActOrderID: i + 1,
+          SectionOrderID: i + 1
+        });
+      });
+    }
+
+    logs.push(createCatalystLog("Data Store", "success", `Case No ${newCaseMaster.CaseNo} successfully written to Catalyst Data Store.`, 18));
+
+    // Hydrate the newly created case
+    const hydratedNewCase = hydrateEvidence(newCaseMaster, role);
+
+    // Create custom conversation greeting
+    const welcomeText = `📁 **Case Dataset Successfully Imported!**
+I have parsed and integrated the case details from \`${fileName}\` into our Catalyst Data Store. 
+
+Here is the structured record I've generated:
+- **Case No**: ${newCaseMaster.CaseNo} (Crime No: ${newCaseMaster.CrimeNo})
+- **Investigating Officer**: Insp. S. Raghavendra
+- **Complainant**: ${hydratedNewCase.complainant?.ComplainantName || "Not listed"}
+- **Accused**: ${hydratedNewCase.accused?.map(a => a.AccusedName).join(", ") || "Not listed"}
+- **Victim**: ${hydratedNewCase.victim?.map(v => v.VictimName).join(", ") || "Not listed"}
+- **Acts & Sections**: ${hydratedNewCase.acts?.map(a => `${a.act.ShortName} Sec ${a.section.SectionCode}`).join(", ") || "None"}
+- **Incident Location**: LAT ${newCaseMaster.latitude}, LNG ${newCaseMaster.longitude}
+- **Brief Facts**: ${newCaseMaster.BriefFacts}
+
+*I have automatically loaded this case as the active citation on the right. How can I assist you with your investigation or interrogation strategy for this case today?*`;
+
+    const welcomeTextKn = `📁 **ಪ್ರಕರಣದ ದತ್ತಾಂಶವನ್ನು ಯಶಸ್ವಿಯಾಗಿ ಆಮದು ಮಾಡಿಕೊಳ್ಳಲಾಗಿದೆ!**
+ನಾನು \`${fileName}\` ನಿಂದ ಪ್ರಕರಣದ ವಿವರಗಳನ್ನು ನಮ್ಮ ಕ್ಯಾಟಲಿಸ್ಟ್ ಡೇಟಾ ಸ್ಟೋರ್‌ಗೆ ಸೇರಿಸಿದ್ದೇನೆ.
+
+ರಚಿಸಲಾದ ಪ್ರಕರಣದ ವಿವರಗಳು ಇಲ್ಲಿವೆ:
+- **ಪ್ರಕರಣದ ಸಂಖ್ಯೆ**: ${newCaseMaster.CaseNo} (ಅಪರಾಧ ಸಂಖ್ಯೆ: ${newCaseMaster.CrimeNo})
+- **ತನಿಖಾಧಿಕಾರಿ**: ಇನ್ಸ್. ಎಸ್. ರಾಘವೇಂದ್ರ
+- **ಫಿರ್ಯಾದಿ**: ${hydratedNewCase.complainant?.ComplainantName || "ಲಭ್ಯವಿಲ್ಲ"}
+- **ಆರೋಪಿಗಳು**: ${hydratedNewCase.accused?.map(a => a.AccusedName).join(", ") || "ಲಭ್ಯವಿಲ್ಲ"}
+- **ಸಂತ್ರಸ್ತರು**: ${hydratedNewCase.victim?.map(v => v.VictimName).join(", ") || "ಲಭ್ಯವಿಲ್ಲ"}
+- **ಕಾನೂನು ವಿಭಾಗಗಳು**: ${hydratedNewCase.acts?.map(a => `${a.act.ShortName} ಸೆಕ್ ${a.section.SectionCode}`).join(", ") || "ಯಾವುದೂ ಇಲ್ಲ"}
+- **ಘಟನೆಯ ಸ್ಥಳ**: ಲ್ಯಾಟಿಟ್ಯೂಡ್ ${newCaseMaster.latitude}, ಲಾಂಗಿಟ್ಯೂಡ್ ${newCaseMaster.longitude}
+- **ಸಂಕ್ಷಿಪ್ತ ವಿವರಣೆ**: ${newCaseMaster.BriefFacts_KN || newCaseMaster.BriefFacts}
+
+*ನಾನು ಈ ಪ್ರಕರಣವನ್ನು ಸೈಟೇಶನ್ ಆಗಿ ಸ್ವಯಂಚಾಲಿತವಾಗಿ ಲೋಡ್ ಮಾಡಿದ್ದೇನೆ. ಈ ಪ್ರಕರಣದ ತನಿಖೆ ಅಥವಾ ವಿಚಾರಣೆಯ ಬಗ್ಗೆ ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?*`;
+
+    // Persist to session chat history
+    let history = sessionCache.get(session_id);
+    if (!history) {
+      history = { messages: [] };
+    }
+
+    const botMsg: Message = {
+      id: `msg_upload_${Date.now()}_b`,
+      sender: "bot",
+      text: welcomeText,
+      textKn: welcomeTextKn,
+      timestamp: new Date().toLocaleTimeString(),
+      language: "en",
+      evidence: [hydratedNewCase],
+      isDirectLookup: true,
+      confidence: 1.0
+    };
+
+    history.messages.push(botMsg);
+    sessionCache.set(session_id, history);
+
+    const totalLatency = Date.now() - startTimer;
+    res.json({
+      success: true,
+      message: botMsg,
+      newCase: hydratedNewCase,
+      logs,
+      totalLatencyMs: totalLatency
+    });
+  } else {
+    res.status(400).json({ error: "Failed to extract valid case details.", logs });
+  }
+});
+
+
 
 // ==========================================
 // VITE DEV SERVER OR STATIC SERVING IN PRODUCTION

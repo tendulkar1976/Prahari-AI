@@ -3,12 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { 
   Shield, MessageSquare, Database, Terminal, Download, Languages, 
   Mic, MicOff, Volume2, VolumeX, Search, User, Server, Activity, 
   CheckCircle2, AlertTriangle, RefreshCw, Compass, MapPin, Lock, 
-  Unlock, FileText, ChevronRight, Sparkles, AlertCircle, FileSpreadsheet, Eye, Info
+  Unlock, FileText, ChevronRight, Sparkles, AlertCircle, FileSpreadsheet, Eye, Info,
+  Paperclip, Upload, UploadCloud
 } from "lucide-react";
 import { 
   UserRole, Message, EvidenceRecord, CatalystServiceLog, DatabaseStats 
@@ -31,7 +32,7 @@ export default function App() {
 
   // --- UI TOGGLES ---
   const [showCatalystConsole, setShowCatalystConsole] = useState<boolean>(true);
-  const [rightPanelTab, setRightPanelTab] = useState<"evidence" | "explorer" | "audit">("evidence");
+  const [rightPanelTab, setRightPanelTab] = useState<"evidence" | "explorer" | "audit" | "upload">("evidence");
   const [loading, setLoading] = useState<boolean>(false);
   
   // --- DATABASE EXPLORER STATES ---
@@ -45,9 +46,15 @@ export default function App() {
   const [isSpeaking, setIsSpeaking] = useState<boolean>(false);
   const [activeAudioMessageId, setActiveAudioMessageId] = useState<string | null>(null);
 
+  // --- DATASET UPLOAD & PASTE STATES ---
+  const [uploading, setUploading] = useState<boolean>(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [pastedText, setPastedText] = useState<string>("");
+
   // --- REFS ---
   const chatBottomRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // --- INITIALIZE SESSION ---
   useEffect(() => {
@@ -317,6 +324,156 @@ export default function App() {
       addConsoleLog("SmartBrowz", "warning", "Report compilation failed.");
     }
   };
+
+  // --- DATASET & FILE INGESTION SERVICE ---
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement> | File) => {
+    let file: File | null = null;
+    if (event instanceof File) {
+      file = event;
+    } else if (event.target.files && event.target.files.length > 0) {
+      file = event.target.files[0];
+    }
+    
+    if (!file) return;
+
+    setUploading(true);
+    setUploadError(null);
+    addConsoleLog("API Gateway", "info", `Initiated upload process for file: ${file.name}`);
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const textContent = e.target?.result as string;
+      await uploadDataToServer(file.name, file.type || "text/plain", textContent);
+    };
+
+    reader.onerror = () => {
+      setUploadError("Failed to read local file.");
+      addConsoleLog("Data Store", "warning", "FileReader failed to load file.");
+      setUploading(false);
+    };
+
+    reader.readAsText(file);
+  };
+
+  const uploadDataToServer = async (name: string, type: string, textContent: string) => {
+    try {
+      addConsoleLog("QuickML RAG", "info", "Sending file text stream to Zoho AppSail API Gateway...");
+      const res = await fetch("/api/upload-dataset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileName: name,
+          fileType: type,
+          content: textContent,
+          sessionId,
+          role: activeRole
+        })
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.error || "Server returned error during ingestion.");
+      }
+
+      const data = await res.json();
+      if (data.success && data.message) {
+        setMessages(prev => [...prev, data.message]);
+        
+        fetchStats();
+        fetchCasesList();
+
+        if (data.newCase) {
+          setSelectedCase(data.newCase);
+          setRightPanelTab("evidence");
+        }
+
+        addConsoleLog("Data Store", "success", `Successfully ingested case! Latency: ${data.totalLatencyMs}ms`);
+      }
+    } catch (err: any) {
+      setUploadError(err.message || "An unexpected error occurred.");
+      addConsoleLog("QuickML RAG", "warning", `Ingestion error: ${err.message}`);
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const handleTextParse = async () => {
+    if (!pastedText.trim()) return;
+
+    setUploading(true);
+    setUploadError(null);
+    addConsoleLog("API Gateway", "info", "Pasted unstructured case note received. Initializing Zia ingestion.");
+
+    await uploadDataToServer("Pasted_Note.txt", "text/plain", pastedText);
+    setPastedText("");
+  };
+
+  const loadSampleReport = async (sampleType: "theft" | "fraud") => {
+    setUploading(true);
+    setUploadError(null);
+    
+    let sampleContent = "";
+    let sampleName = "";
+    
+    if (sampleType === "theft") {
+      sampleName = "sample_shoplifting_theft.txt";
+      sampleContent = `CASE REPORT: Shoplifting Theft at Commercial Street Store
+Date of Incident: 2026-07-15
+Location: 'Trendy Threads' Store, Commercial Street, Bangalore City (LAT: 12.9811, LNG: 77.6088)
+Complainant: Store Manager Suresh Nair, age 45, Male.
+Accused: Rajesh S, age 29, Male, caught by security guard (PersonID: A1).
+Brief Facts: The accused entered the retail showroom around 14:00 hours. He picked up 3 premium designer silk sarees worth Rs 45,000, concealed them in a black lined paper bag, and tried to exit without paying. The store's magnetic RFID alarm triggered, and security intercepted him. Insp. S. Raghavendra arrived and arrested him. Recovered the sarees and registered case under IPC Section 379 (Punishment for Theft). Status is Under Investigation.`;
+    } else {
+      sampleName = "sample_cyber_fraud.json";
+      sampleContent = JSON.stringify({
+        caseMaster: {
+          CrimeNo: "104430006202600008",
+          CaseNo: "202600008",
+          CrimeRegisteredDate: "2026-07-16",
+          latitude: 12.9304,
+          longitude: 77.6784,
+          BriefFacts: "Complainant Harish Gupta, an IT engineer in Outer Ring Road, reported a WhatsApp work-from-home review fraud. He was approached by telegram handle @earn_easy and lured into investing money in fake crypto wallets, losing Rs 4,50,000. Cyber branch traced bank account to Bihar and arrested Accused Prince Kumar (Age 26, Male). Case registered under IT Act Section 66D and IPC Section 420. Status: Under Investigation.",
+          BriefFacts_KN: "ಹರೀಶ್ ಗುಪ್ತಾ ಎಂಬ ಐಟಿ ಉದ್ಯೋಗಿ ವಾಟ್ಸಾಪ್ ಮೂಲಕ ವರ್ಕ್-ಫ್ರಮ್-ಹೋಮ್ ವಂಚನೆಗೆ ಒಳಗಾಗಿ 4.5 ಲಕ್ಷ ರೂಪಾಯಿ ಕಳೆದುಕೊಂಡಿದ್ದಾರೆ. ಆರೋಪಿ ಪ್ರಿನ್ಸ್ ಕುಮಾರ್‌ನನ್ನು ಬಿಹಾರದಲ್ಲಿ ಬಂಧಿಸಲಾಗಿದೆ. ಐಟಿ ಆಕ್ಟ್ 66D ಮತ್ತು ಐಪಿಸಿ 420 ಅಡಿಯಲ್ಲಿ ಪ್ರಕರಣ ದಾಖಲಿಸಲಾಗಿದೆ."
+        },
+        complainant: {
+          ComplainantName: "Harish Gupta",
+          AgeYear: 32,
+          GenderID: 1
+        },
+        accused: [
+          {
+            AccusedName: "Prince Kumar",
+            AgeYear: 26,
+            GenderID: 1,
+            PersonID: "A1"
+          }
+        ],
+        victim: [
+          {
+            VictimName: "Harish Gupta",
+            AgeYear: 32,
+            GenderID: 1,
+            VictimPolice: "0"
+          }
+        ],
+        acts: [
+          {
+            ActCode: "IT_ACT",
+            SectionCode: "66D"
+          },
+          {
+            ActCode: "IPC",
+            SectionCode: "420"
+          }
+        ]
+      }, null, 2);
+    }
+
+    addConsoleLog("API Gateway", "info", `Loading sample template: ${sampleName}`);
+    await uploadDataToServer(sampleName, sampleType === "fraud" ? "application/json" : "text/plain", sampleContent);
+  };
+
 
   // --- HELPERS FOR VIEWING SEEDED TABLES ---
   const getExplorerTableHeaders = () => {
@@ -702,6 +859,25 @@ export default function App() {
                 >
                   {isRecording ? <MicOff size={18} /> : <Mic size={18} />}
                 </button>
+
+                {/* Quick File Upload Button */}
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={uploading}
+                  className="absolute left-12 p-2 rounded-lg flex items-center justify-center transition-all text-slate-400 hover:text-slate-600 hover:bg-slate-100 disabled:opacity-50"
+                  title="Quick upload case report (.txt, .json, .csv)"
+                >
+                  <Paperclip size={18} className={uploading ? "animate-pulse" : ""} />
+                </button>
+
+                {/* Hidden File Input */}
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  onChange={handleFileUpload}
+                  accept=".json,.txt,.csv"
+                  className="hidden"
+                />
                 
                 <input
                   type="text"
@@ -709,7 +885,7 @@ export default function App() {
                   onChange={(e) => setChatInput(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && handleSendMessage()}
                   placeholder={language === "kn" ? "ಕನ್ನಡದಲ್ಲಿ ಅಪರಾಧ ಸಂಖ್ಯೆ ಅಥವಾ ವಿವರಗಳನ್ನು ನಮೂದಿಸಿ..." : "Search by Crime No, Accused Name, Section Code, or query..."}
-                  className="w-full pl-12 pr-24 py-4 bg-slate-100 border-none rounded-xl text-sm focus:ring-2 focus:ring-slate-400 outline-none text-slate-800 placeholder-slate-400 transition-shadow"
+                  className="w-full pl-[84px] pr-24 py-4 bg-slate-100 border-none rounded-xl text-sm focus:ring-2 focus:ring-slate-400 outline-none text-slate-800 placeholder-slate-400 transition-shadow"
                 />
 
                 <div className="absolute right-2 flex items-center gap-1.5">
@@ -750,6 +926,13 @@ export default function App() {
               >
                 <Database size={13} />
                 <span>Live DB Explorer</span>
+              </button>
+              <button
+                onClick={() => setRightPanelTab("upload")}
+                className={`flex-1 py-2 text-center font-bold rounded-lg transition-all flex items-center justify-center gap-1.5 ${rightPanelTab === "upload" ? "bg-white text-slate-950 shadow-sm border border-slate-200" : "text-slate-500 hover:text-slate-800"}`}
+              >
+                <Upload size={13} />
+                <span>Import Dataset</span>
               </button>
             </div>
 
@@ -1042,6 +1225,108 @@ export default function App() {
                     <span>KSP Relational Cardinality Note:</span>
                   </span>
                   <p><strong>CaseMaster (PK: CaseMasterID)</strong> holds 1-to-Many relationships with Accused, Victim, and ComplainantDetails. Access masking is automatically adjusted in live session based on security clearance levels.</p>
+                </div>
+
+              </div>
+            )}
+
+            {/* --- TAB 3: IMPORT DATASET & AI EXTRACTOR --- */}
+            {rightPanelTab === "upload" && (
+              <div className="flex-1 overflow-y-auto p-5 space-y-5" id="dataset_upload_view">
+                
+                <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm space-y-4">
+                  <div className="border-b border-slate-100 pb-3">
+                    <h3 className="text-sm font-bold text-slate-900 flex items-center gap-1.5">
+                      <UploadCloud size={16} className="text-slate-500" />
+                      <span>Ingest New Case / Dataset</span>
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-1">Upload structured JSON case schemas or paste unstructured reports. Zia AI will parse entities and initiate a conversational audit.</p>
+                  </div>
+
+                  {/* Drag and Drop Zone */}
+                  <div 
+                    onClick={() => fileInputRef.current?.click()}
+                    onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                        handleFileUpload(e.dataTransfer.files[0]);
+                      }
+                    }}
+                    className={`border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center cursor-pointer transition-all hover:bg-slate-50 hover:border-slate-400 ${
+                      uploading ? "bg-slate-50 border-slate-300" : "bg-white border-slate-200"
+                    }`}
+                  >
+                    <UploadCloud size={32} className={`mb-2 stroke-1 ${uploading ? "text-slate-400 animate-bounce" : "text-slate-300"}`} />
+                    <span className="text-xs font-semibold text-slate-700">Drag & drop files here</span>
+                    <span className="text-[10px] text-slate-400 mt-1 font-mono">Supports .json, .txt, .csv</span>
+                    {uploading && (
+                      <span className="text-[10px] text-slate-500 font-bold bg-amber-100 text-amber-800 border border-amber-200 px-2 py-0.5 rounded-full mt-3 animate-pulse">
+                        Zia processing...
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Manual Paste Text Zone */}
+                  <div className="space-y-1.5">
+                    <label className="text-[10px] font-mono font-bold text-slate-400 uppercase tracking-wide block">Or Paste Unstructured Case Details:</label>
+                    <textarea
+                      value={pastedText}
+                      onChange={(e) => setPastedText(e.target.value)}
+                      placeholder="Example: Inspector Raghavendra arrested Mahesh Bhat on July 18 under Section 302 for murder..."
+                      rows={4}
+                      className="w-full text-xs p-3 bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:ring-2 focus:ring-slate-300 outline-none text-slate-800 placeholder-slate-400 transition-all font-sans"
+                    />
+                    <button
+                      onClick={handleTextParse}
+                      disabled={uploading || !pastedText.trim()}
+                      className="w-full py-2.5 bg-slate-900 hover:bg-slate-800 text-white disabled:opacity-50 transition-colors text-xs font-bold rounded-lg shadow-sm flex items-center justify-center gap-1.5"
+                    >
+                      <Sparkles size={13} className="text-amber-400" />
+                      <span>Parse & Ingest with AI</span>
+                    </button>
+                  </div>
+
+                  {/* Error display */}
+                  {uploadError && (
+                    <div className="flex items-start gap-2 bg-red-50 border border-red-200 p-3 rounded-lg text-red-800 text-xs animate-shake">
+                      <AlertTriangle size={14} className="mt-0.5 text-red-600 shrink-0" />
+                      <p className="leading-normal">
+                        <strong>Ingestion Failed:</strong> {uploadError}
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                {/* Preseeded Interactive Sample Buttons */}
+                <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm space-y-3.5">
+                  <div>
+                    <h4 className="text-xs font-mono font-bold text-slate-400 uppercase tracking-wider">Test Sample Ingestion</h4>
+                    <p className="text-[10px] text-slate-400 mt-0.5">Click a sample to test the ingestion flow instantly.</p>
+                  </div>
+                  
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      onClick={() => loadSampleReport("theft")}
+                      disabled={uploading}
+                      className="p-3 bg-slate-50 hover:bg-amber-500/10 hover:border-amber-500 border border-slate-200 rounded-lg text-left transition-all hover:shadow-sm"
+                    >
+                      <span className="font-mono text-[9px] bg-slate-200 text-slate-700 px-1.5 py-0.5 rounded font-bold uppercase tracking-wider block w-max mb-1.5">Unstructured Text</span>
+                      <span className="text-[11px] font-bold text-slate-800 block">Theft Case Report</span>
+                      <span className="text-[10px] text-slate-400 mt-1 block line-clamp-2">Rajesh S caught shoplifting silk sarees under Section 379...</span>
+                    </button>
+
+                    <button
+                      onClick={() => loadSampleReport("fraud")}
+                      disabled={uploading}
+                      className="p-3 bg-slate-50 hover:bg-amber-500/10 hover:border-amber-500 border border-slate-200 rounded-lg text-left transition-all hover:shadow-sm"
+                    >
+                      <span className="font-mono text-[9px] bg-blue-100 text-blue-800 px-1.5 py-0.5 rounded font-bold uppercase tracking-wider block w-max mb-1.5">Structured JSON</span>
+                      <span className="text-[11px] font-bold text-slate-800 block">WhatsApp Job Fraud</span>
+                      <span className="text-[10px] text-slate-400 mt-1 block line-clamp-2">Pre-mapped JSON for Section 66D outer ring road phishing...</span>
+                    </button>
+                  </div>
                 </div>
 
               </div>
