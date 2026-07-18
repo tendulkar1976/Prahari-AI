@@ -371,8 +371,20 @@ export default function App() {
       });
 
       if (!res.ok) {
-        const errorData = await res.json();
-        throw new Error(errorData.error || "Server returned error during ingestion.");
+        let errMsg = "Server returned error during ingestion.";
+        try {
+          const errorData = await res.json();
+          errMsg = errorData.error || errorData.message || JSON.stringify(errorData);
+        } catch (jsonErr) {
+          try {
+            const textData = await res.text();
+            if (textData) {
+              const cleanText = textData.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+              errMsg = cleanText.substring(0, 150);
+            }
+          } catch (textErr) {}
+        }
+        throw new Error(errMsg);
       }
 
       const data = await res.json();
